@@ -3,11 +3,35 @@ import numpy as np
 import gtsam
 from gtsam.symbol_shorthand import X, V, B
 from scipy.spatial.transform import Rotation
-from utils.geometry import calculate_preintegration_and_jacobian, pose_matrix_to_tum_format
-from .imu_process import IMUProcessor
-from utils.debug import Debugger
+from .geometry import calculate_preintegration_and_jacobian, pose_matrix_to_tum_format
+
+class VIOInitFrame:
+    def __init__(self, stamp_id, t_sec, pose):
+        self.stamp_id = stamp_id
+        self.t_sec = float(t_sec)
+        self.pose = pose.copy()
+
+    def get_timestamp(self):
+        return self.t_sec
+
+    def get_global_pose(self):
+        return self.pose
+
+    def set_global_pose(self, T):
+        self.pose = T.copy()
 
 class VIOInitializer:
+    @staticmethod
+    def make_init_frames(vio_init_buffer):
+        return [
+            VIOInitFrame(
+                item["stamp_id"],
+                item["t_sec"],
+                item["pose"],
+            )
+            for item in vio_init_buffer
+        ]
+
     @staticmethod
     def solve_gyro_bias(keyframes, imu_factors, T_bc):
         H_b = np.zeros((3, 3))
@@ -171,7 +195,7 @@ class VIOInitializer:
         # print(f"【System Init】: H: {H}")
         # print(f"【System Init】: b: {b}")
         # Debugger.visualize_matrix(H, title="Hessian Matrix", save_path="hessian_matrix.png")
-        Debugger.save_full_matrix_python(H)
+        # Debugger.save_full_matrix_python(H)
         
         H = H * 1000.0
         b = b * 1000.0
@@ -371,7 +395,7 @@ class VIOInitializer:
             # 变换速度到世界系下 (速度向量也需要旋转)，这里执行了一次原地修改
             velocities[i*3 : i*3+3] = R_final_w_c0 @ velocities[i*3 : i*3+3]
 
-            print(f"【Initializer】: KF {i}, Velocity: {velocities[i*3 : i*3+3]}")
+            # print(f"【Initializer】: KF {i}, Velocity: {velocities[i*3 : i*3+3]}")
         
         # 打印初始化的轨迹
         # output_path = 'test_trajectory.txt'

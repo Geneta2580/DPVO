@@ -1,3 +1,5 @@
+from collections import deque
+
 import numpy as np
 import torch
 import torch.multiprocessing as mp
@@ -9,6 +11,8 @@ from .lietorch import SE3
 from .net import VONet
 from .patchgraph import PatchGraph
 from .utils import *
+from .imu_processor import IMUProcessor, prepare_measurements, preintegration_summary
+from .vio_initializer import VIOInitializer
 
 mp.set_start_method('spawn', True)
 
@@ -38,6 +42,8 @@ class DPVO:
         ### state attributes ###
         self.tlist = []
         self.counter = 0
+        # pg.tstamps_[i] stores internal stamp id (counter); stamp_to_time maps id -> wall time (s).
+        self.stamp_to_time = {}
 
         # keep track of global-BA calls
         self.ran_global_ba = np.zeros(100000, dtype=bool)
@@ -78,6 +84,365 @@ class DPVO:
         self.viewer = None
         if viz:
             self.start_viewer()
+
+        # IMU数据处理配置
+        imu_cfg = {
+            "gravity": cfg.IMU_GRAVITY,
+            "accel_noise_sigma": cfg.IMU_ACCEL_NOISE,
+            "gyro_noise_sigma": cfg.IMU_GYRO_NOISE,
+            "accel_bias_rw_sigma": cfg.IMU_ACCEL_BIAS_RW,
+            "gyro_bias_rw_sigma": cfg.IMU_GYRO_BIAS_RW,
+        }
+        self.imu_processor = IMUProcessor(imu_cfg)
+        self.T_bc = np.asarray(cfg.T_BC, dtype=np.float64).reshape(4, 4)
+        self.last_cam_t_sec = None
+        self.imu_preintegrations = []
+        # Global IMU buffer: (t_sec, reading) sorted by timestamp (streaming append).
+        self.imu_buffer = deque()
+
+        # V-I 初始化数据
+        self.vio_initialized = False
+        self.vio_init_buffer = deque(maxlen=60)
+        self.vio_init_T_wc0 = None
+        self.vio_init_result = None
+        accept_n = int(cfg.VIO_INIT_ACCEPT_COUNT)
+        self.vio_init_scale_history = deque(maxlen=accept_n)
+        self.vio_init_bg_history = deque(maxlen=accept_n)
+
+    # ============================================= VIO 相关添加函数 =============================================
+    # ====================== 辅助函数 ======================
+    # ====== 辅助函数：：IMU相关函数 ======
+    def push_imu_measurements(self, imu_meas):
+        """Cache all IMU samples from the reader into imu_buffer (time-ordered)."""
+        if not imu_meas:
+            return
+        for meas in prepare_measurements(imu_meas):
+            t_sec = meas[0]
+            if self.imu_buffer and t_sec < self.imu_buffer[-1][0]:
+                # Rare out-of-order sample: keep buffer sorted by timestamp.
+                self.imu_buffer.append(meas)
+                self.imu_buffer = deque(sorted(self.imu_buffer, key=lambda x: x[0]))
+            else:
+                self.imu_buffer.append(meas)
+
+    def pop_imu_until(self, end_time):
+        """Pop and return IMU samples with timestamp <= end_time (for preintegration)."""
+        return IMUProcessor.get_imu_interval_with(self.imu_buffer, end_time)
+
+    def get_imu_between(self, t0, t1, include_start_prev=True):
+        """
+        Non-destructive query of IMU samples in interval (t0, t1].
+        Optionally prepend the last IMU sample before or at t0.
+
+        Returned format matches IMUProcessor.pre_integration():
+            List[(t_sec, Reading(gyro, accel))]
+        """
+        if t1 <= t0:
+            return []
+
+        selected = []
+        prev = None
+
+        for item in self.imu_buffer:
+            ts = item[0]
+
+            if ts <= t0:
+                prev = item
+                continue
+
+            if ts <= t1:
+                selected.append(item)
+            else:
+                break
+
+        # 取前一个值方便IMU插值，精度更高
+        if include_start_prev and prev is not None:
+            return [prev] + selected
+
+        return selected
+
+    def build_single_imu_factor(self, kf_i, kf_j):
+        ts_i = kf_i.get_timestamp()
+        ts_j = kf_j.get_timestamp()
+
+        imu_meas = self.get_imu_between(ts_i, ts_j, include_start_prev=True)
+
+        if len(imu_meas) < 2:
+            print(
+                f"[VIO Init] not enough IMU between "
+                f"{ts_i:.6f} -> {ts_j:.6f}, n={len(imu_meas)}"
+            )
+            return None
+
+        pim = self.imu_processor.pre_integration(
+            imu_meas,
+            ts_i,
+            ts_j,
+        )
+
+        if pim is None:
+            print(
+                f"[VIO Init] preintegration failed between "
+                f"{ts_i:.6f} -> {ts_j:.6f}"
+            )
+            return None
+
+        return {
+            "start_kf_timestamp": ts_i,
+            "end_kf_timestamp": ts_j,
+            "imu_measurements": imu_meas,
+            "imu_preintegration": pim,
+        }
+    
+    def build_imu_factors_for_init(self, keyframes):
+        """
+        Build IMU preintegration factors for consecutive VIO init frames.
+        """
+        if len(keyframes) < 2:
+            return None
+
+        imu_factors = []
+
+        for kf_i, kf_j in zip(keyframes[:-1], keyframes[1:]):
+            factor = self.build_single_imu_factor(kf_i, kf_j)
+            if factor is None:
+                return None
+
+            imu_factors.append(factor)
+
+        return imu_factors
+
+    # ====== 辅助函数：：视觉相关函数 ======
+    def register_stamp_time(self, stamp_id, tstamp_sec=None, fallback=None):
+        """Record wall-clock time (seconds) for an internal stamp id."""
+        t = tstamp_sec if tstamp_sec is not None else fallback
+        if t is not None:
+            self.stamp_to_time[int(stamp_id)] = float(t)
+
+    def get_stamp_time(self, stamp_id):
+        """Query wall-clock time (seconds) from internal stamp id in pg.tstamps_."""
+        return self.stamp_to_time.get(int(stamp_id))
+
+    def get_frame_time(self, frame_idx):
+        """Query wall-clock time (seconds) for active buffer slot frame_idx in [0, n)."""
+        if frame_idx < 0 or frame_idx >= self.n:
+            return None
+        return self.get_stamp_time(self.pg.tstamps_[frame_idx])
+
+    def get_T_wc_from_pg(self, frame_idx):
+        """Return DPVO internal pose as 4x4 T_wc."""
+        T = SE3(self.pg.poses_[frame_idx]).inv().matrix().detach().cpu().numpy()
+        if T.ndim == 3:
+            T = T[0]
+        return T
+
+    def get_T_c0_ci_from_pg(self, frame_idx):
+        """
+        Convert DPVO pose to VIOInitializer pose T_c0_ci.
+        """
+        T_wc_i = self.get_T_wc_from_pg(frame_idx)
+
+        if self.vio_init_T_wc0 is None:
+            self.vio_init_T_wc0 = T_wc_i.copy()
+
+        return np.linalg.inv(self.vio_init_T_wc0) @ T_wc_i
+
+    def append_vio_init_frame(self, frame_idx):
+        """Append one valid visual pose and its timestamp to vio_init_buffer."""
+        if self.vio_initialized:
+            return
+
+        if frame_idx < 0 or frame_idx >= self.n:
+            return
+
+        stamp_id = int(self.pg.tstamps_[frame_idx])
+        t_sec = self.get_stamp_time(stamp_id)
+
+        if t_sec is None:
+            return
+
+        T_c0_ci = self.get_T_c0_ci_from_pg(frame_idx)
+
+        self.vio_init_buffer.append({
+            "stamp_id": stamp_id,
+            "t_sec": t_sec,
+            "pose": T_c0_ci.copy(),
+        })
+
+    # ====================== V-I初始化函数 ======================
+    def check_visual_motion_for_init(self, keyframes):
+        poses = [kf.get_global_pose() for kf in keyframes]
+        trans = [T[:3, 3] for T in poses]
+
+        path_len = sum(
+            np.linalg.norm(trans[i + 1] - trans[i])
+            for i in range(len(trans) - 1)
+        )
+
+        baseline = max(np.linalg.norm(t - trans[0]) for t in trans)
+        end_disp = np.linalg.norm(trans[-1] - trans[0])
+
+        return path_len, baseline, end_disp
+
+    def check_imu_coverage(self, t0, t1):
+        if len(self.imu_buffer) < 2:
+            return False, None, None
+
+        imu_t0 = self.imu_buffer[0][0]
+        imu_t1 = self.imu_buffer[-1][0]
+
+        return imu_t0 <= t0 and imu_t1 >= t1, imu_t0, imu_t1
+
+    def check_imu_excitation(self, t0, t1):
+        imu = [m for m in self.imu_buffer if t0 <= m[0] <= t1]
+        if len(imu) < 10:
+            return 0.0
+
+        acc = np.array([m[1].accel for m in imu])
+        acc_mean = acc.mean(axis=0)
+        acc_var = np.mean(np.linalg.norm(acc - acc_mean, axis=1) ** 2)
+        return acc_var
+
+    def reset_vio_init_state(self):
+        """Clear VIO init buffer and acceptance history (e.g. after VO bootstrap)."""
+        self.vio_init_buffer.clear()
+        self.vio_init_T_wc0 = None
+        self.vio_init_scale_history.clear()
+        self.vio_init_bg_history.clear()
+        self.vio_init_result = None
+
+    def try_vio_initialization(self):
+        """Try V-I initialization; accept when recent scale estimates are stable."""
+        if self.vio_initialized:
+            return True
+
+        keyframes = VIOInitializer.make_init_frames(self.vio_init_buffer)
+        n_kf = len(keyframes)
+
+        if n_kf < self.cfg.VIO_INIT_MIN_FRAMES:
+            return False
+
+        if n_kf < self.cfg.VIO_INIT_SOLVE_MIN_FRAMES:
+            return False
+
+        if (n_kf - self.cfg.VIO_INIT_SOLVE_MIN_FRAMES) % self.cfg.VIO_INIT_SOLVE_INTERVAL != 0:
+            return False
+
+        t0 = keyframes[0].get_timestamp()
+        t1 = keyframes[-1].get_timestamp()
+        duration = t1 - t0
+
+        if duration < self.cfg.VIO_INIT_MIN_TIME:
+            return False
+
+        # 1. 检查视觉平移 baseline
+        path_len, baseline, end_disp = self.check_visual_motion_for_init(keyframes)
+        # print(f"[VIO Init] path={path_len:.6f}, baseline={baseline:.6f}, end_disp={end_disp:.6f}")
+        if path_len < self.cfg.VIO_INIT_MIN_VISUAL_PATH or baseline < self.cfg.VIO_INIT_MIN_VISUAL_BASELINE:
+            return False
+
+        # 2. 检查 IMU coverage
+        ok, imu_t0, imu_t1 = self.check_imu_coverage(t0, t1)
+        if not ok:
+            print(
+                f"[VIO Init] waiting IMU coverage: "
+                f"imu=[{imu_t0}, {imu_t1}], visual=[{t0}, {t1}]"
+            )
+            return False
+
+        # 3. 检查 IMU excitation
+        acc_var = self.check_imu_excitation(t0, t1)
+        # print(f"[VIO Init] acc_var={acc_var:.6f}, imu_buf={len(self.imu_buffer)}")
+        if acc_var < self.cfg.VIO_INIT_MIN_ACC_VAR:
+            return False
+
+        # 4. 从 imu_buffer 构造 imu_factors
+        imu_factors = self.build_imu_factors_for_init(keyframes)
+
+        if imu_factors is None or len(imu_factors) != len(keyframes) - 1:
+            print("[VIO Init] failed to build imu_factors")
+            return False
+
+        # 5. 调用 VIOInitializer.initialize()
+        ok, scale, bg, velocities, gravity_w = VIOInitializer.initialize(
+            keyframes=keyframes,
+            imu_factors=imu_factors,
+            imu_processor=self.imu_processor,
+            gravity_magnitude=self.cfg.IMU_GRAVITY,
+            T_bc=self.T_bc,
+        )
+
+        if not ok or scale is None or scale <= 0:
+            print(
+                f"[VIO Init] solve failed: ok={ok}, scale={scale}, "
+                f"frames={n_kf}, bg={bg}"
+            )
+            return False
+
+        # 6. V-I初始化稳定性检查
+        self.vio_init_scale_history.append(float(scale))
+        self.vio_init_bg_history.append(np.asarray(bg, dtype=np.float64).reshape(-1))
+
+        print(
+            f"[VIO Init] solve ok: frames={n_kf}, scale={scale:.4f}, "
+            f"bg={np.asarray(bg).reshape(-1)}, gravity_w={gravity_w}"
+        )
+
+        need = self.cfg.VIO_INIT_ACCEPT_COUNT # 最近n帧尺度稳定性检查
+        if len(self.vio_init_scale_history) < need:
+            print(
+                f"[VIO Init] collecting scale history "
+                f"({len(self.vio_init_scale_history)}/{need})"
+            )
+            return False
+
+        recent = np.array(self.vio_init_scale_history, dtype=np.float64)
+        rel_std = float(np.std(recent) / np.mean(recent))
+
+        if rel_std >= self.cfg.VIO_INIT_ACCEPT_REL_STD:
+            print(
+                f"[VIO Init] scale not stable yet: recent={recent}, rel_std={rel_std:.4f}"
+            )
+            return False
+
+        self.vio_initialized = True
+        self.vio_init_result = {
+            "scale": float(scale),
+            "bg": np.asarray(bg, dtype=np.float64).reshape(-1),
+            "velocities": velocities,
+            "gravity_w": gravity_w,
+            "keyframes": keyframes,
+        }
+        print(
+            f"[VIO Init] accepted: scale={scale:.4f}, rel_std={rel_std:.4f}, "
+            f"frames={n_kf}, duration={duration:.3f}s"
+        )
+        return True
+
+    def preintegrate_imu(self, imu_meas, tstamp_sec):
+        measurements = prepare_measurements(imu_meas)
+        if len(measurements) < 2:
+            return None, None
+
+        if self.last_cam_t_sec is not None:
+            start_time = self.last_cam_t_sec
+        else:
+            start_time = measurements[0][0] - 1e-6
+
+        end_time = tstamp_sec if tstamp_sec is not None else measurements[-1][0]
+        pim = self.imu_processor.pre_integration(measurements, start_time, end_time)
+        if pim is None:
+            return None, None
+
+        if tstamp_sec is not None:
+            self.last_cam_t_sec = tstamp_sec
+        else:
+            self.last_cam_t_sec = end_time
+
+        self.imu_preintegrations.append(pim)
+        return pim, preintegration_summary(pim)
+    # ============================================= VIO 相关添加函数 =============================================
+
 
     def load_long_term_loop_closure(self):
         try:
@@ -374,8 +739,12 @@ class DPVO:
         return flatmeshgrid(torch.arange(t0, t1, device="cuda"),
             torch.arange(max(self.n-r, 0), self.n, device="cuda"), indexing='ij')
 
-    def __call__(self, tstamp, image, intrinsics):
+    def __call__(self, tstamp, image, intrinsics, imu_meas=None, tstamp_sec=None):
         """ track new frame """
+
+        # 加入IMU量测
+        if imu_meas is not None:
+            self.push_imu_measurements(imu_meas)
 
         if self.cfg.CLASSIC_LOOP_CLOSURE:
             self.long_term_lc(image, self.n)
@@ -397,8 +766,12 @@ class DPVO:
                     return_color=True)
 
         ### update state attributes ###
-        self.tlist.append(tstamp)
-        self.pg.tstamps_[self.n] = self.counter
+        stamp_id = self.counter
+        wall_t = tstamp_sec if tstamp_sec is not None else float(tstamp)
+        self.tlist.append(wall_t)
+        self.pg.tstamps_[self.n] = stamp_id
+        # 将时间戳和帧id对应映射
+        self.register_stamp_time(stamp_id, tstamp_sec=tstamp_sec, fallback=tstamp)
         self.pg.intrinsics_[self.n] = intrinsics / self.RES
 
         # color info for visualization
@@ -472,8 +845,19 @@ class DPVO:
             for itr in range(12):
                 self.update()
 
+            self.reset_vio_init_state()
+            for i in range(self.n):
+                self.append_vio_init_frame(i)
+            self.try_vio_initialization()
+ 
         elif self.is_initialized:
             self.update()
+
+            # V-I初始化逻辑
+            if not self.vio_initialized:
+                self.append_vio_init_frame(self.n - 1)
+                self.try_vio_initialization()
+
             self.keyframe()
 
         if self.cfg.CLASSIC_LOOP_CLOSURE:

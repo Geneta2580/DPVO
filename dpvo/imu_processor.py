@@ -5,6 +5,35 @@ from typing import List, Tuple
 
 ImuData = Tuple[float, any]
 
+
+def prepare_measurements(imu_meas):
+    """Convert euroc_stream samples to (t_sec, data) for pre_integration."""
+    from collections import namedtuple
+    Reading = namedtuple("Reading", ["gyro", "accel"])
+    prepared = []
+    for t_sec, sample in imu_meas:
+        prepared.append((
+            float(t_sec),
+            Reading(
+                np.asarray(sample.gyro, dtype=np.float64).reshape(3),
+                np.asarray(sample.accel, dtype=np.float64).reshape(3),
+            ),
+        ))
+    return prepared
+
+
+def preintegration_summary(pim):
+    """Extract preintegrated deltas as plain numpy values."""
+    if pim is None:
+        return None
+    return {
+        "delta_R": np.array(pim.deltaRij().matrix()),
+        "delta_p": np.array(pim.deltaPij()).reshape(3),
+        "delta_v": np.array(pim.deltaVij()).reshape(3),
+        "delta_t": float(pim.deltaTij()),
+    }
+
+
 class IMUProcessor:
     def __init__(self, config):
         self.g = config.get('gravity', 9.81)
