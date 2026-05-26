@@ -213,11 +213,11 @@ class DPVO:
         return coords.permute(0, 1, 4, 2, 3).contiguous()
 
     def append_factors(self, ii, jj):
-        self.pg.jj = torch.cat([self.pg.jj, jj])
-        self.pg.kk = torch.cat([self.pg.kk, ii])
-        self.pg.ii = torch.cat([self.pg.ii, self.ix[ii]])
+        self.pg.jj = torch.cat([self.pg.jj, jj]) # 目标帧
+        self.pg.kk = torch.cat([self.pg.kk, ii]) # 全局patch索引
+        self.pg.ii = torch.cat([self.pg.ii, self.ix[ii]]) # 源帧
 
-        net = torch.zeros(1, len(ii), self.DIM, **self.kwargs)
+        net = torch.zeros(1, len(ii), self.DIM, **self.kwargs) # 384维隐状态特征
         self.pg.net = torch.cat([self.pg.net, net], dim=1)
 
     def remove_factors(self, m, store: bool):
@@ -265,8 +265,8 @@ class DPVO:
 
     def keyframe(self):
 
-        i = self.n - self.cfg.KEYFRAME_INDEX - 1
-        j = self.n - self.cfg.KEYFRAME_INDEX + 1
+        i = self.n - self.cfg.KEYFRAME_INDEX - 1 # n - 5 向前5帧
+        j = self.n - self.cfg.KEYFRAME_INDEX + 1 # n - 3 向前3帧
         m = self.motionmag(i, j) + self.motionmag(j, i)
  
         if m / 2 < self.cfg.KEYFRAME_THRESH:
@@ -389,6 +389,7 @@ class DPVO:
         image = 2 * (image[None,None] / 255.0) - 0.5
         
         with autocast(enabled=self.cfg.MIXED_PRECISION):
+            # 提取patch特征，同时初始化patch的几何参数（x,y,d,全1）
             fmap, gmap, imap, patches, _, clr = \
                 self.network.patchify(image,
                     patches_per_image=self.cfg.PATCHES_PER_FRAME, 
@@ -407,17 +408,18 @@ class DPVO:
         self.pg.index_[self.n + 1] = self.n + 1
         self.pg.index_map_[self.n + 1] = self.m + self.M
 
+        # 初始化外推当前帧位姿
         if self.n > 1:
             if self.cfg.MOTION_MODEL == 'DAMPED_LINEAR':
-                P1 = SE3(self.pg.poses_[self.n-1])
-                P2 = SE3(self.pg.poses_[self.n-2])
+                P1 = SE3(self.pg.poses_[self.n-1]) # 上一帧
+                P2 = SE3(self.pg.poses_[self.n-2]) # 上上一帧
 
                 # To deal with varying camera hz
                 *_, a,b,c = [1]*3 + self.tlist
-                fac = (c-b) / (b-a)
+                fac = (c-b) / (b-a) # 用 tlist 里最近三帧时间戳，把步长缩放到：当前间隔 / 上一间隔
 
-                xi = self.cfg.MOTION_DAMPING * fac * (P1 * P2.inv()).log()
-                tvec_qvec = (SE3.exp(xi) * P1).data
+                xi = self.cfg.MOTION_DAMPING * fac * (P1 * P2.inv()).log() # 外推一半位姿变化量的位姿
+                tvec_qvec = (SE3.exp(xi) * P1).data # 李代数exp映射
                 self.pg.poses_[self.n] = tvec_qvec
             else:
                 tvec_qvec = self.poses[self.n-1]
@@ -426,6 +428,8 @@ class DPVO:
         # TODO better depth initialization
         patches[:,:,2] = torch.rand_like(patches[:,:,2,0,0,None,None])
         if self.is_initialized:
+            # 对最近3帧中的所有patch的深度求中值
+            # 为当前帧所有patch（Nx3x3）都赋统一值
             s = torch.median(self.pg.patches_[self.n-3:self.n,:,2])
             patches[:,:,2] = s
 
@@ -439,6 +443,7 @@ class DPVO:
 
         self.counter += 1        
         if self.n > 0 and not self.is_initialized:
+            # 初始化运动检查，投影后计算相关性，然后输入更新模块预测光流运动
             if self.motion_probe() < 2.0:
                 self.pg.delta[self.counter - 1] = (self.counter - 2, Id[0])
                 return
@@ -455,9 +460,12 @@ class DPVO:
                     self.append_factors(lii, ljj)
 
         # Add forward and backward factors
+        # 这里将所有满足条件的前向边以及反向边加入到patch graph中
+        # 对于枚举的所有__edges_forw/back都执行append_factors操作
         self.append_factors(*self.__edges_forw())
         self.append_factors(*self.__edges_back())
 
+        # 初始化逻辑
         if self.n == 8 and not self.is_initialized:
             self.is_initialized = True
 

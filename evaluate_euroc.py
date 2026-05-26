@@ -1,4 +1,3 @@
-import glob
 import os
 from multiprocessing import Process, Queue
 from pathlib import Path
@@ -15,7 +14,7 @@ from evo.tools import file_interface
 from dpvo.config import cfg
 from dpvo.dpvo import DPVO
 from dpvo.plot_utils import plot_trajectory
-from dpvo.stream import image_stream
+from dpvo.stream import euroc_stream
 from dpvo.utils import Timer
 
 SKIP = 0
@@ -26,19 +25,20 @@ def show_image(image, t=0):
     cv2.waitKey(t)
 
 @torch.no_grad()
-def run(cfg, network, imagedir, calib, stride=1, viz=False, show_img=False):
+def run(cfg, network, imagedir, imu_dir, calib, stride=1, viz=False, show_img=False):
 
     slam = None
 
     queue = Queue(maxsize=8)
-    reader = Process(target=image_stream, args=(queue, imagedir, calib, stride, 0))
+    reader = Process(target=euroc_stream, args=(queue, imagedir, imu_dir, calib, stride, 0))
     reader.start()
 
     while 1:
-        (t, image, intrinsics) = queue.get()
-        if t < 0: break
+        t, timestamp_ns, image, intrinsics, imu_measurements = queue.get()
+        if t < 0:
+            break
 
-        image = torch.from_numpy(image).permute(2,0,1).cuda()
+        image = torch.from_numpy(image).permute(2, 0, 1).cuda()
         intrinsics = torch.from_numpy(intrinsics).cuda()
 
         if show_img:
@@ -48,7 +48,8 @@ def run(cfg, network, imagedir, calib, stride=1, viz=False, show_img=False):
             slam = DPVO(cfg, network, ht=image.shape[1], wd=image.shape[2], viz=viz)
 
         with Timer("SLAM", enabled=False):
-            slam(t, image, intrinsics)
+            slam(timestamp_ns, image, intrinsics)
+            # imu_measurements: list of (t_sec, ImuSample) since last frame — wire into DPVO/IMUProcessor next
 
     reader.join()
 
@@ -82,29 +83,31 @@ if __name__ == '__main__':
 
     euroc_scenes = [
         "MH_01_easy",
-        "MH_02_easy",
-        "MH_03_medium",
-        "MH_04_difficult",
-        "MH_05_difficult",
-        "V1_01_easy",
-        "V1_02_medium",
-        "V1_03_difficult",
-        "V2_01_easy",
-        "V2_02_medium",
-        "V2_03_difficult",
+        # "MH_02_easy",
+        # "MH_03_medium",
+        # "MH_04_difficult",
+        # "MH_05_difficult",
+        # "V1_01_easy",
+        # "V1_02_medium",
+        # "V1_03_difficult",
+        # "V2_01_easy",
+        # "V2_02_medium",
+        # "V2_03_difficult",
     ]
 
     results = {}
     for scene in euroc_scenes:
-        imagedir = os.path.join(args.eurocdir, scene, "mav0/cam0/data")
-        groundtruth = "datasets/euroc_groundtruth/{}.txt".format(scene) 
+        scene_dir = os.path.join(args.eurocdir, scene)
+        imagedir = os.path.join(scene_dir, "mav0/cam0/data")
+        imu_dir = os.path.join(scene_dir, "mav0/imu0")
+        groundtruth = "datasets/euroc_groundtruth/{}.txt".format(scene)
 
         scene_results = []
         for i in range(args.trials):
-            traj_est, timestamps = run(cfg, args.network, imagedir, "calib/euroc.txt", args.stride, args.viz, args.show_img)
-
-            images_list = sorted(glob.glob(os.path.join(imagedir, "*.png")))[::args.stride]
-            tstamps = [float(x.split('/')[-1][:-4]) for x in images_list]
+            traj_est, tstamps = run(
+                cfg, args.network, imagedir, imu_dir,
+                "calib/euroc.txt", args.stride, args.viz, args.show_img,
+            )
 
             traj_est = PoseTrajectory3D(
                 positions_xyz=traj_est[:,:3],

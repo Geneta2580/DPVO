@@ -128,6 +128,7 @@ class Patchifier(nn.Module):
             x = torch.gather(x, 1, ix[:, -patches_per_image:])
             y = torch.gather(y, 1, ix[:, -patches_per_image:])
 
+        # 提取patch中心
         elif centroid_sel_strat == 'RANDOM':
             x = torch.randint(1, w-1, size=[n, patches_per_image], device="cuda")
             y = torch.randint(1, h-1, size=[n, patches_per_image], device="cuda")
@@ -135,6 +136,7 @@ class Patchifier(nn.Module):
         else:
             raise NotImplementedError(f"Patch centroid selection not implemented: {centroid_sel_strat}")
 
+        # 计算每个patch对应的128以及384维特征
         coords = torch.stack([x, y], dim=-1).float()
         imap = altcorr.patchify(imap[0], coords, 0).view(b, -1, DIM, 1, 1)
         gmap = altcorr.patchify(fmap[0], coords, P//2).view(b, -1, 128, P, P)
@@ -145,6 +147,11 @@ class Patchifier(nn.Module):
         if disps is None:
             disps = torch.ones(b, n, h, w, device="cuda")
 
+        # 初始化patch的几何参数
+        # patches形状为：[1, patch_per_frame, 3, 3, 3]
+        # 通道 0: x（该格在特征图上的横坐标）
+        # 通道 1: y（纵坐标）
+        # 通道 2: d（逆深度/视差，可优化）
         grid, _ = coords_grid_with_index(disps, device=fmap.device)
         patches = altcorr.patchify(grid[0], coords, P//2).view(b, -1, 3, P, P)
 

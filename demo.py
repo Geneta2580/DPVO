@@ -38,6 +38,7 @@ def run(cfg, network, imagedir, calib, stride=1, skip=0, viz=False, timeit=False
         (t, image, intrinsics) = queue.get()
         if t < 0: break
 
+        # 这里就已经放到GPU上了？
         image = torch.from_numpy(image).permute(2,0,1).cuda()
         intrinsics = torch.from_numpy(intrinsics).cuda()
 

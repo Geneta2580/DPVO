@@ -42,9 +42,9 @@ class PatchGraph:
 
         ### edge information ###
         self.net = torch.zeros(1, 0, DIM, **kwargs)
-        self.ii = torch.as_tensor([], dtype=torch.long, device="cuda")
-        self.jj = torch.as_tensor([], dtype=torch.long, device="cuda")
-        self.kk = torch.as_tensor([], dtype=torch.long, device="cuda")
+        self.ii = torch.as_tensor([], dtype=torch.long, device="cuda") # src帧索引
+        self.jj = torch.as_tensor([], dtype=torch.long, device="cuda") # tgt帧索引
+        self.kk = torch.as_tensor([], dtype=torch.long, device="cuda") # patch全局索引
 
         ### inactive edge information (i.e., no longer updated, but useful for BA) ###
         self.ii_inac = torch.as_tensor([], dtype=torch.long, device="cuda")
