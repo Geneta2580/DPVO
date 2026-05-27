@@ -1,4 +1,5 @@
 from collections import deque
+from pathlib import Path
 
 import numpy as np
 import torch
@@ -13,6 +14,8 @@ from .patchgraph import PatchGraph
 from .utils import *
 from .imu_processor import IMUProcessor, prepare_measurements, preintegration_summary
 from .vio_initializer import VIOInitializer
+from .VIOBackend import VIOBackend
+from .geometry import matrix_to_lietorch_se3_data, pose_matrix_to_tum_format
 
 mp.set_start_method('spawn', True)
 
@@ -85,6 +88,7 @@ class DPVO:
         if viz:
             self.start_viewer()
 
+        # =========================== VIO 相关变量初始化 ===========================
         # IMU数据处理配置
         imu_cfg = {
             "gravity": cfg.IMU_GRAVITY,
@@ -108,6 +112,10 @@ class DPVO:
         accept_n = int(cfg.VIO_INIT_ACCEPT_COUNT)
         self.vio_init_scale_history = deque(maxlen=accept_n)
         self.vio_init_bg_history = deque(maxlen=accept_n)
+        self.vio_init_dump_path = None
+
+        # V-I 优化后端
+        self.vio_backend = None
 
     # ============================================= VIO 相关添加函数 =============================================
     # ====================== 辅助函数 ======================
@@ -162,8 +170,18 @@ class DPVO:
         return selected
 
     def build_single_imu_factor(self, kf_i, kf_j):
+        """
+        Preintegrate all IMU samples between two consecutive init keyframes.
+
+        Uses the full (non-destructive) imu_buffer interval (t_i, t_j] plus one
+        sample at or before t_i for interpolation at segment start.
+        """
         ts_i = kf_i.get_timestamp()
         ts_j = kf_j.get_timestamp()
+
+        if ts_j <= ts_i:
+            print(f"[VIO Init] invalid keyframe interval: {ts_i:.6f} -> {ts_j:.6f}")
+            return None
 
         imu_meas = self.get_imu_between(ts_i, ts_j, include_start_prev=True)
 
@@ -183,7 +201,7 @@ class DPVO:
         if pim is None:
             print(
                 f"[VIO Init] preintegration failed between "
-                f"{ts_i:.6f} -> {ts_j:.6f}"
+                f"{ts_i:.6f} -> {ts_j:.6f}, n_imu={len(imu_meas)}"
             )
             return None
 
@@ -196,7 +214,10 @@ class DPVO:
     
     def build_imu_factors_for_init(self, keyframes):
         """
-        Build IMU preintegration factors for consecutive VIO init frames.
+        Build one IMU preintegration factor per consecutive init keyframe pair.
+
+        keyframes are time-decimated by VIO_INIT_KEYFRAME_INTERVAL; each factor
+        integrates the complete IMU stream between its two timestamps.
         """
         if len(keyframes) < 2:
             return None
@@ -247,43 +268,218 @@ class DPVO:
 
         return np.linalg.inv(self.vio_init_T_wc0) @ T_wc_i
 
+    def find_active_frame_idx_by_stamp(self, stamp_id):
+        """Return active pg index for a stamp id, or None if the frame was removed."""
+        stamp_id = int(stamp_id)
+        for i in range(self.n):
+            if int(self.pg.tstamps_[i]) == stamp_id:
+                return i
+        return None
+
+    def snapshot_to_active_motionmag(self, anchor_item, curr_frame_idx, robust=True):
+        """
+        Compute geometric patch-flow magnitude from frozen snapshot anchor to
+        current active frame.
+
+        Build a tiny 2-frame temporary tensors:
+            frame 0: anchor snapshot
+            frame 1: current active frame
+
+        Then project anchor patches from frame 0 to frame 1.
+        """
+        if curr_frame_idx < 0 or curr_frame_idx >= self.n:
+            return None
+
+        try:
+            with torch.no_grad():
+                device = self.pg.poses_.device
+
+                pose0 = anchor_item["pose_data"].to(device=device).view(1, 7)
+                pose1 = self.pg.poses_[curr_frame_idx].detach().clone().to(device=device).view(1, 7)
+                poses2 = torch.cat([pose0, pose1], dim=0).view(1, 2, 7)
+
+                patch0 = anchor_item["patches"].to(device=device).view(1, self.M, 3, 3, 3)
+                # dummy second-frame patches; not used because kk only indexes anchor patches
+                patch1 = self.pg.patches_[curr_frame_idx].detach().clone().to(device=device).view(1, self.M, 3, 3, 3)
+                patches2 = torch.cat([patch0, patch1], dim=1)
+
+                intr0 = anchor_item["intrinsics"].to(device=device).view(1, 4)
+                intr1 = self.pg.intrinsics_[curr_frame_idx].detach().clone().to(device=device).view(1, 4)
+                intrinsics2 = torch.cat([intr0, intr1], dim=0).view(1, 2, 4)
+
+                kk = torch.arange(0, self.M, device=device, dtype=torch.long)
+                ii = torch.zeros_like(kk)       # source frame index 0
+                jj = torch.ones_like(kk)        # target frame index 1
+
+                flow, _ = pops.flow_mag(
+                    SE3(poses2),
+                    patches2,
+                    intrinsics2,
+                    ii,
+                    jj,
+                    kk,
+                    beta=0.5,
+                )
+
+                if flow.numel() == 0:
+                    return None
+
+                flow = flow.float().reshape(-1)
+
+                if robust:
+                    score = torch.quantile(flow, 0.5)
+                else:
+                    score = flow.mean()
+
+                score = float(score.detach().cpu().item())
+                if not np.isfinite(score):
+                    return None
+
+                return score
+
+        except Exception as e:
+            print(f"[VIO Init] snapshot_to_active_motionmag failed: {e}")
+            return None
+
+    def make_vio_frame_snapshot(self, frame_idx, stamp_id, t_sec, T_c0_ci, parallax=np.nan, anchor_stamp=-1):
+        """
+        Snapshot all information needed by VIO initialization and future
+        parallax checks. This snapshot remains valid after DPVO keyframe culling.
+        """
+        return {
+            "stamp_id": int(stamp_id),
+            "t_sec": float(t_sec),
+
+            # Pose used by VIOInitializer.
+            # Convention: T_c0_ci = inv(T_wc0) @ T_wc_i
+            "pose": np.asarray(T_c0_ci, dtype=np.float64).copy(),
+
+            # Geometric snapshot for future parallax check.
+            # DPVO internal pose data is T_cw-like lietorch SE3 data.
+            "pose_data": self.pg.poses_[frame_idx].detach().clone(),
+            "patches": self.pg.patches_[frame_idx].detach().clone(),
+            "intrinsics": self.pg.intrinsics_[frame_idx].detach().clone(),
+
+            # Debug metadata.
+            "parallax": float(parallax) if np.isfinite(parallax) else np.nan,
+            "anchor_stamp": int(anchor_stamp),
+        }
+
     def append_vio_init_frame(self, frame_idx):
-        """Append one valid visual pose and its timestamp to vio_init_buffer."""
+        """
+        Append only frames passing parallax selection into vio_init_buffer.
+
+        The last accepted init frame is stored as a full snapshot, so it can be
+        used as anchor even after DPVO keyframe culling.
+
+        Returns:
+            True if a new frame was appended, False otherwise.
+        """
         if self.vio_initialized:
-            return
+            return False
 
         if frame_idx < 0 or frame_idx >= self.n:
-            return
+            return False
 
         stamp_id = int(self.pg.tstamps_[frame_idx])
         t_sec = self.get_stamp_time(stamp_id)
-
         if t_sec is None:
-            return
+            return False
 
         T_c0_ci = self.get_T_c0_ci_from_pg(frame_idx)
 
-        self.vio_init_buffer.append({
-            "stamp_id": stamp_id,
-            "t_sec": t_sec,
-            "pose": T_c0_ci.copy(),
-        })
+        # First frame: accept directly as anchor snapshot.
+        if len(self.vio_init_buffer) == 0:
+            item = self.make_vio_frame_snapshot(
+                frame_idx=frame_idx,
+                stamp_id=stamp_id,
+                t_sec=t_sec,
+                T_c0_ci=T_c0_ci,
+                parallax=np.nan,
+                anchor_stamp=-1,
+            )
+            self.vio_init_buffer.append(item)
+            print(f"[VIO Init] append anchor snapshot: stamp={stamp_id}")
+            return True
+
+        anchor_item = self.vio_init_buffer[-1]
+        anchor_stamp = int(anchor_item["stamp_id"])
+        anchor_t = float(anchor_item["t_sec"])
+
+        # Time decimation relative to last accepted snapshot.
+        min_dt = float(self.cfg.VIO_INIT_KEYFRAME_INTERVAL)
+        dt = float(t_sec - anchor_t)
+        if dt < min_dt:
+            return False
+
+        # Cross-window parallax check using frozen snapshot anchor.
+        parallax = self.snapshot_to_active_motionmag(anchor_item, frame_idx, robust=True)
+
+        if parallax is None:
+            print(
+                f"[VIO Init] snapshot parallax unavailable: "
+                f"anchor_stamp={anchor_stamp}, curr_stamp={stamp_id}, dt={dt:.3f}"
+            )
+            return False
+
+        min_parallax = float(self.cfg.VIO_INIT_MIN_PAIR_PARALLAX)
+        if parallax < min_parallax:
+            print(
+                f"[VIO Init] parallax too low: "
+                f"anchor_stamp={anchor_stamp}, curr_stamp={stamp_id}, "
+                f"dt={dt:.3f}, {parallax:.3f} < {min_parallax:.3f}"
+            )
+            return False
+
+        item = self.make_vio_frame_snapshot(
+            frame_idx=frame_idx,
+            stamp_id=stamp_id,
+            t_sec=t_sec,
+            T_c0_ci=T_c0_ci,
+            parallax=parallax,
+            anchor_stamp=anchor_stamp,
+        )
+        self.vio_init_buffer.append(item)
+
+        print(
+            f"[VIO Init] append snapshot: n={len(self.vio_init_buffer)}, "
+            f"anchor_stamp={anchor_stamp}, curr_stamp={stamp_id}, "
+            f"dt={dt:.3f}, parallax={parallax:.3f}"
+        )
+        return True
+
+    def save_vio_init_dpvo_tum(self, path):
+        """
+        Save frozen DPVO visual poses in the VIO init sliding window as TUM.
+
+        Uses self.vio_init_buffer only. This guarantees the saved trajectory is
+        exactly the same visual pose set used by VIOInitializer.make_init_frames().
+        """
+        path = Path(path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+
+        if self.vio_init_T_wc0 is None:
+            print("[VIO Init] cannot save frozen init trajectory: vio_init_T_wc0 is None")
+            return
+
+        lines = []
+        for item in self.vio_init_buffer:
+            T_c0_ci = np.asarray(item["pose"], dtype=np.float64)
+
+            # Convert relative visual pose back to DPVO/world T_wc.
+            # Since item["pose"] = T_c0_ci = inv(T_wc0) @ T_wc_i:
+            T_wc = self.vio_init_T_wc0 @ T_c0_ci
+
+            tx, ty, tz, qx, qy, qz, qw = pose_matrix_to_tum_format(T_wc)
+            lines.append(
+                f"{item['t_sec']:.10f} {tx:.10f} {ty:.10f} {tz:.10f} "
+                f"{qx:.10f} {qy:.10f} {qz:.10f} {qw:.10f}"
+            )
+
+        path.write_text("\n".join(lines) + ("\n" if lines else ""))
+        print(f"[VIO Init] saved FROZEN DPVO window trajectory to {path} ({len(lines)} poses)")
 
     # ====================== V-I初始化函数 ======================
-    def check_visual_motion_for_init(self, keyframes):
-        poses = [kf.get_global_pose() for kf in keyframes]
-        trans = [T[:3, 3] for T in poses]
-
-        path_len = sum(
-            np.linalg.norm(trans[i + 1] - trans[i])
-            for i in range(len(trans) - 1)
-        )
-
-        baseline = max(np.linalg.norm(t - trans[0]) for t in trans)
-        end_disp = np.linalg.norm(trans[-1] - trans[0])
-
-        return path_len, baseline, end_disp
-
     def check_imu_coverage(self, t0, t1):
         if len(self.imu_buffer) < 2:
             return False, None, None
@@ -293,15 +489,48 @@ class DPVO:
 
         return imu_t0 <= t0 and imu_t1 >= t1, imu_t0, imu_t1
 
-    def check_imu_excitation(self, t0, t1):
-        imu = [m for m in self.imu_buffer if t0 <= m[0] <= t1]
-        if len(imu) < 10:
-            return 0.0
+    def check_imu_excitation(self, imu_factors):
+        """
+        VINS-Fusion style IMU excitation check.
 
-        acc = np.array([m[1].accel for m in imu])
-        acc_mean = acc.mean(axis=0)
-        acc_var = np.mean(np.linalg.norm(acc - acc_mean, axis=1) ** 2)
-        return acc_var
+        For each visual keyframe interval:
+            tmp_g_i = delta_v_ij / dt_ij
+
+        Then compute:
+            excitation = sqrt( sum_i ||tmp_g_i - mean(tmp_g)||^2 / (N - 1) )
+
+        This measures how much the preintegrated average acceleration changes
+        across visual intervals.
+        """
+        if imu_factors is None or len(imu_factors) < 2:
+            return 0.0, None
+
+        tmp_g_list = []
+
+        for factor_info in imu_factors:
+            pim = factor_info.get("imu_preintegration", None)
+            if pim is None:
+                continue
+
+            dt = float(pim.deltaTij())
+            if dt <= 1e-6 or not np.isfinite(dt):
+                continue
+
+            dv = np.asarray(pim.deltaVij(), dtype=np.float64).reshape(3)
+            tmp_g_list.append(dv / dt)
+
+        if len(tmp_g_list) < 2:
+            return 0.0, None
+
+        tmp_g = np.asarray(tmp_g_list, dtype=np.float64)
+        avg_g = np.mean(tmp_g, axis=0)
+
+        excitation = np.sqrt(
+            np.sum(np.linalg.norm(tmp_g - avg_g, axis=1) ** 2)
+            / max(1, len(tmp_g) - 1)
+        )
+
+        return float(excitation), avg_g
 
     def reset_vio_init_state(self):
         """Clear VIO init buffer and acceptance history (e.g. after VO bootstrap)."""
@@ -312,36 +541,23 @@ class DPVO:
         self.vio_init_result = None
 
     def try_vio_initialization(self):
-        """Try V-I initialization; accept when recent scale estimates are stable."""
+        """Try V-I initialization using selected VIO init frames only."""
         if self.vio_initialized:
             return True
 
-        keyframes = VIOInitializer.make_init_frames(self.vio_init_buffer)
+        keyframes_all = VIOInitializer.make_init_frames(self.vio_init_buffer)
+        keyframes = keyframes_all[1:] 
         n_kf = len(keyframes)
 
-        if n_kf < self.cfg.VIO_INIT_MIN_FRAMES:
-            return False
-
-        if n_kf < self.cfg.VIO_INIT_SOLVE_MIN_FRAMES:
-            return False
-
-        if (n_kf - self.cfg.VIO_INIT_SOLVE_MIN_FRAMES) % self.cfg.VIO_INIT_SOLVE_INTERVAL != 0:
+        min_frames = int(self.cfg.VIO_INIT_MIN_FRAMES)
+        if n_kf < min_frames:
             return False
 
         t0 = keyframes[0].get_timestamp()
         t1 = keyframes[-1].get_timestamp()
-        duration = t1 - t0
+        duration = float(t1 - t0)
 
-        if duration < self.cfg.VIO_INIT_MIN_TIME:
-            return False
-
-        # 1. 检查视觉平移 baseline
-        path_len, baseline, end_disp = self.check_visual_motion_for_init(keyframes)
-        # print(f"[VIO Init] path={path_len:.6f}, baseline={baseline:.6f}, end_disp={end_disp:.6f}")
-        if path_len < self.cfg.VIO_INIT_MIN_VISUAL_PATH or baseline < self.cfg.VIO_INIT_MIN_VISUAL_BASELINE:
-            return False
-
-        # 2. 检查 IMU coverage
+        # 1. IMU coverage
         ok, imu_t0, imu_t1 = self.check_imu_coverage(t0, t1)
         if not ok:
             print(
@@ -350,21 +566,34 @@ class DPVO:
             )
             return False
 
-        # 3. 检查 IMU excitation
-        acc_var = self.check_imu_excitation(t0, t1)
-        # print(f"[VIO Init] acc_var={acc_var:.6f}, imu_buf={len(self.imu_buffer)}")
-        if acc_var < self.cfg.VIO_INIT_MIN_ACC_VAR:
-            return False
-
-        # 4. 从 imu_buffer 构造 imu_factors
+        # 2. build IMU factors
         imu_factors = self.build_imu_factors_for_init(keyframes)
-
         if imu_factors is None or len(imu_factors) != len(keyframes) - 1:
             print("[VIO Init] failed to build imu_factors")
             return False
 
-        # 5. 调用 VIOInitializer.initialize()
-        ok, scale, bg, velocities, gravity_w = VIOInitializer.initialize(
+        # 3. IMU excitation check, VINS-Fusion style
+        imu_exc, avg_g = self.check_imu_excitation(imu_factors)
+
+        min_imu_exc = float(self.cfg.VIO_INIT_MIN_ACC_VAR)
+        require_imu_exc = True
+
+        print(
+            f"[VIO Init] imu excitation={imu_exc:.4f}, "
+            f"threshold={min_imu_exc:.4f}, "
+            f"avg_g={avg_g if avg_g is not None else None}"
+        )
+
+        if imu_exc < min_imu_exc:
+            print(
+                f"[VIO Init] IMU excitation not enough: "
+                f"{imu_exc:.4f} < {min_imu_exc:.4f}"
+            )
+            if require_imu_exc:
+                return False
+
+        # 4. solve V-I init
+        ok, scale, bg, velocities, gravity_w, R_w_c0 = VIOInitializer.initialize(
             keyframes=keyframes,
             imu_factors=imu_factors,
             imu_processor=self.imu_processor,
@@ -372,23 +601,31 @@ class DPVO:
             T_bc=self.T_bc,
         )
 
-        if not ok or scale is None or scale <= 0:
+        if not ok or scale is None or scale <= 0 or not np.isfinite(scale):
             print(
                 f"[VIO Init] solve failed: ok={ok}, scale={scale}, "
                 f"frames={n_kf}, bg={bg}"
             )
             return False
 
-        # 6. V-I初始化稳定性检查
+        # 5. scale stability
         self.vio_init_scale_history.append(float(scale))
         self.vio_init_bg_history.append(np.asarray(bg, dtype=np.float64).reshape(-1))
 
+        parallaxes = [
+            item.get("parallax", np.nan)
+            for item in self.vio_init_buffer
+            if np.isfinite(item.get("parallax", np.nan))
+        ]
+        mean_parallax = float(np.mean(parallaxes)) if len(parallaxes) > 0 else float("nan")
+
         print(
-            f"[VIO Init] solve ok: frames={n_kf}, scale={scale:.4f}, "
+            f"[VIO Init] solve ok: frames={n_kf}, duration={duration:.3f}s, "
+            f"scale={scale:.4f}, mean_parallax={mean_parallax:.3f}, "
             f"bg={np.asarray(bg).reshape(-1)}, gravity_w={gravity_w}"
         )
 
-        need = self.cfg.VIO_INIT_ACCEPT_COUNT # 最近n帧尺度稳定性检查
+        need = int(self.cfg.VIO_INIT_ACCEPT_COUNT)
         if len(self.vio_init_scale_history) < need:
             print(
                 f"[VIO Init] collecting scale history "
@@ -396,28 +633,60 @@ class DPVO:
             )
             return False
 
-        recent = np.array(self.vio_init_scale_history, dtype=np.float64)
-        rel_std = float(np.std(recent) / np.mean(recent))
+        recent = np.asarray(self.vio_init_scale_history, dtype=np.float64)
+        mean_scale = float(np.mean(recent))
+        rel_std = float(np.std(recent) / (mean_scale + 1e-12))
 
-        if rel_std >= self.cfg.VIO_INIT_ACCEPT_REL_STD:
+        if rel_std >= float(self.cfg.VIO_INIT_ACCEPT_REL_STD):
             print(
-                f"[VIO Init] scale not stable yet: recent={recent}, rel_std={rel_std:.4f}"
+                f"[VIO Init] scale not stable yet: "
+                f"recent={recent}, rel_std={rel_std:.4f}"
             )
             return False
 
+        # 6. accept
         self.vio_initialized = True
         self.vio_init_result = {
             "scale": float(scale),
             "bg": np.asarray(bg, dtype=np.float64).reshape(-1),
             "velocities": velocities,
             "gravity_w": gravity_w,
+            "R_w_c0": R_w_c0,
             "keyframes": keyframes,
+            "mean_parallax": mean_parallax,
         }
+
+        # 暂时不建议直接写回 DPVO
+        # self.apply_vio_sim3_to_dpvo_state(scale, R_w_c0)
+
         print(
             f"[VIO Init] accepted: scale={scale:.4f}, rel_std={rel_std:.4f}, "
-            f"frames={n_kf}, duration={duration:.3f}s"
+            f"frames={n_kf}, duration={duration:.3f}s, "
+            f"mean_parallax={mean_parallax:.3f}"
         )
+
+        if self.vio_init_dump_path:
+            self.save_vio_init_dpvo_tum(self.vio_init_dump_path)
+
         return True
+
+    def _maybe_init_vio_backend(self):
+        """Create VIO backend once visual-inertial initialization is accepted."""
+        if not self.vio_initialized or self.vio_init_result is None:
+            return
+
+        if self.vio_backend is not None:
+            return
+
+        self.vio_backend = VIOBackend(
+            cfg=self.cfg,
+            T_bc=self.T_bc,
+            imu_processor=self.imu_processor,
+        )
+        self.vio_backend.initialize_from_vio_result(
+            dpvo=self,
+            vio_init_result=self.vio_init_result,
+        )
 
     def preintegrate_imu(self, imu_meas, tstamp_sec):
         measurements = prepare_measurements(imu_meas)
@@ -441,6 +710,65 @@ class DPVO:
 
         self.imu_preintegrations.append(pim)
         return pim, preintegration_summary(pim)
+
+    def apply_vio_sim3_to_dpvo_state(self, scale, R_w_c0, t_w_c0=None):
+        """
+        Apply VIO initialization Sim(3) to DPVO visual state.
+
+        Original DPVO pose convention through get_T_wc_from_pg():
+            X_c0 = T_c0_ci @ X_ci
+
+        After this function:
+            X_w = T_w_ci @ X_ci
+
+        where:
+            R_w_ci = R_w_c0 @ R_c0_ci
+            p_w_ci = R_w_c0 @ (scale * p_c0_ci) + t_w_c0
+
+        Patch channel 2 is treated as inverse depth/disparity, so:
+            idepth_metric = idepth_visual / scale
+        """
+        if getattr(self, "dpvo_metric_scaled", False):
+            return
+
+        scale = float(scale)
+        R_w_c0 = np.asarray(R_w_c0, dtype=np.float64).reshape(3, 3)
+
+        if t_w_c0 is None:
+            t_w_c0 = np.zeros(3, dtype=np.float64)
+        else:
+            t_w_c0 = np.asarray(t_w_c0, dtype=np.float64).reshape(3)
+
+        if scale <= 0 or not np.isfinite(scale):
+            print(f"[VIO Init] invalid Sim3 scale: {scale}")
+            return
+
+        with torch.no_grad():
+            for i in range(self.n):
+                # 注意这里DPVO将第一帧c0作为视觉的world系
+                T_c0_ci = self.get_T_wc_from_pg(i)
+
+                T_w_ci = np.eye(4, dtype=np.float64)
+                T_w_ci[:3, :3] = R_w_c0 @ T_c0_ci[:3, :3]
+                T_w_ci[:3, 3] = R_w_c0 @ (scale * T_c0_ci[:3, 3]) + t_w_c0
+
+                T_ci_w = np.linalg.inv(T_w_ci)
+
+                # Convert 4x4 T_ci_w back to SE3 7D data.
+                self.pg.poses_[i] = matrix_to_lietorch_se3_data(T_ci_w, ref_tensor=self.pg.poses_)
+
+            # DPVO patch geometry is inverse depth / disparity.
+            self.pg.patches_[:self.n, :, 2] /= scale
+
+            # 处理相对位姿的平移部分
+            for k, value in list(self.pg.delta.items()):
+                t0, dP = value
+                dP_data = dP.data.clone()
+                dP_data[..., :3] *= scale
+                self.pg.delta[k] = (t0, SE3(dP_data))
+
+        self.dpvo_metric_scaled = True
+        print(f"[VIO Init] applied Sim3 to DPVO state: scale={scale:.6f}")
     # ============================================= VIO 相关添加函数 =============================================
 
 
@@ -781,7 +1109,7 @@ class DPVO:
         self.pg.index_[self.n + 1] = self.n + 1
         self.pg.index_map_[self.n + 1] = self.m + self.M
 
-        # 初始化外推当前帧位姿
+        # 初始化外推当前帧位姿（后续使用IMU预积分外推）
         if self.n > 1:
             if self.cfg.MOTION_MODEL == 'DAMPED_LINEAR':
                 P1 = SE3(self.pg.poses_[self.n-1]) # 上一帧
@@ -849,16 +1177,24 @@ class DPVO:
             for i in range(self.n):
                 self.append_vio_init_frame(i)
             self.try_vio_initialization()
- 
+            self._maybe_init_vio_backend()
+
         elif self.is_initialized:
             self.update()
-
             # V-I初始化逻辑
             if not self.vio_initialized:
-                self.append_vio_init_frame(self.n - 1)
-                self.try_vio_initialization()
+                appended = self.append_vio_init_frame(self.n - 1)
+                if appended:
+                    self.try_vio_initialization()
+                    self._maybe_init_vio_backend()
 
+            # 后端优化逻辑
+            if self.vio_backend is not None:
+                if self.counter % self.cfg.VIO_BACKEND_OPT_INTERVAL == 0:
+                    self.vio_backend.optimize_current_dpvo_window_batch(self)
+            
             self.keyframe()
+
 
         if self.cfg.CLASSIC_LOOP_CLOSURE:
             self.long_term_lc.attempt_loop_closure(self.n)

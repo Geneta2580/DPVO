@@ -44,7 +44,8 @@ def show_image(image, t=0):
     cv2.waitKey(t)
 
 @torch.no_grad()
-def run(cfg, network, imagedir, imudir, calib, stride=1, viz=False, show_img=False, desc=None):
+def run(cfg, network, imagedir, imudir, calib, stride=1, viz=False, show_img=False,
+        desc=None, vio_init_dump_path=None):
 
     slam = None
 
@@ -71,6 +72,7 @@ def run(cfg, network, imagedir, imudir, calib, stride=1, viz=False, show_img=Fal
 
             if slam is None:
                 slam = DPVO(cfg, network, ht=image.shape[1], wd=image.shape[2], viz=viz)
+                slam.vio_init_dump_path = vio_init_dump_path
 
             with Timer("SLAM", enabled=False):
                 slam(t, image, intrinsics, imu_meas, tstamp_sec)
@@ -99,6 +101,8 @@ if __name__ == '__main__':
     parser.add_argument('--plot', action="store_true")
     parser.add_argument('--opts', nargs='+', default=[])
     parser.add_argument('--save_trajectory', action="store_true")
+    parser.add_argument('--dump_vio_init_traj', action="store_true",
+                        help="Save DPVO poses in the VIO init window as TUM when init succeeds")
     args = parser.parse_args()
 
     cfg.merge_from_file(args.config)
@@ -133,10 +137,18 @@ if __name__ == '__main__':
 
         scene_results = []
         for i in range(args.trials):
+            vio_init_dump_path = None
+            if args.dump_vio_init_traj:
+                Path("saved_trajectories").mkdir(exist_ok=True)
+                vio_init_dump_path = (
+                    f"saved_trajectories/{scene}_vio_init_dpvo_trial{i + 1:02d}.txt"
+                )
+
             traj_est, tstamps = run(
                 cfg, args.network, imagedir, imudir,
                 "calib/euroc.txt", args.stride, args.viz, args.show_img,
                 desc=f"{scene} trial {i + 1}",
+                vio_init_dump_path=vio_init_dump_path,
             )
             # Camera filename timestamps are in nanoseconds (same as EuRoC GT file header).
             tstamps_sec = tstamps * 1e-9
@@ -158,7 +170,7 @@ if __name__ == '__main__':
                 traj_ref, traj_est, max_diff=max_diff)
 
             result = main_ape.ape(traj_ref, traj_est, est_name='traj', 
-                pose_relation=PoseRelation.translation_part, align=True, correct_scale=True)
+                pose_relation=PoseRelation.translation_part, align=True, correct_scale=False)
             ate_score = result.stats["rmse"]
 
             Path("trajectory_plots").mkdir(exist_ok=True)

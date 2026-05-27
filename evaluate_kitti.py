@@ -119,7 +119,7 @@ if __name__ == '__main__':
 
     results = {}
     for scene in kitti_scenes:
-        groundtruth = args.kittidir / "dataset" / "poses" / f"{scene}.txt"
+        groundtruth = args.kittidir / "ground_truth_pose_odometry" /"dataset" / "poses" / f"{scene}.txt"
         poses_ref = file_interface.read_kitti_poses_file(groundtruth)
         print(f"Evaluating KITTI {scene} with {poses_ref.num_poses // args.stride} poses")
 

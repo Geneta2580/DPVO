@@ -1,12 +1,35 @@
 import numpy as np
 from scipy.spatial.transform import Rotation
 import gtsam
+import torch
 
 def pose_matrix_to_tum_format(pose_matrix):
     """Converts a 4x4 SE(3) pose matrix to a TUM trajectory format string components."""
     t = pose_matrix[:3, 3]
     q = Rotation.from_matrix(pose_matrix[:3, :3]).as_quat() # q is [x, y, z, w]
     return t[0], t[1], t[2], q[0], q[1], q[2], q[3]
+
+def matrix_to_lietorch_se3_data(T, ref_tensor=None):
+    """
+    Convert 4x4 matrix to lietorch SE3 data format:
+        [tx, ty, tz, qx, qy, qz, qw]
+    """
+    T = np.asarray(T, dtype=np.float64)
+
+    t = T[:3, 3]
+    q = Rotation.from_matrix(T[:3, :3]).as_quat()  # qx qy qz qw
+    q = q / np.linalg.norm(q)
+
+    data = np.concatenate([t, q], axis=0)
+
+    if ref_tensor is not None:
+        return torch.as_tensor(
+            data,
+            dtype=ref_tensor.dtype,
+            device=ref_tensor.device,
+        )
+
+    return torch.as_tensor(data, dtype=torch.float32)
 
 def skew_symmetric(v):
     """构建向量的反对称矩阵 (3x3)"""

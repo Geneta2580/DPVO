@@ -64,7 +64,12 @@ class VIOInitializer:
 
                 delta_R_imu = gtsam.Rot3(delta_R_mat)
                 
-                error_R = gtsam.Rot3.Logmap((R_i_vis.inverse().compose(R_j_vis).compose(delta_R_imu.inverse())))
+                # error_R = gtsam.Rot3.Logmap((R_i_vis.inverse().compose(R_j_vis).compose(delta_R_imu.inverse())))
+                R_ij_vis = R_i_vis.inverse().compose(R_j_vis)
+
+                error_R = gtsam.Rot3.Logmap(
+                    delta_R_imu.inverse().compose(R_ij_vis)
+                )
                 
                 H_b += J_R_bg.T @ J_R_bg
                 Z_b += J_R_bg.T @ error_R.reshape(3, 1)
@@ -126,22 +131,32 @@ class VIOInitializer:
             R_j = (T_j_pose @ np.linalg.inv(T_bc))[:3, :3]  # R_j = R_c0_bj (IMU旋转)
             t_j = T_j_pose[:3, 3]                         # t_j = p_c0_cj (相机平移)
 
-            # ======================= 负数尺度debug =======================
-            # # 获取视觉位移 (世界系)
-            # t_diff_world = t_j - t_i
-            # # 投影到 Body 系 (使用你算出的 R_i)
-            # t_diff_body_vis = R_i.T @ t_diff_world
-
-            # # 获取 IMU 位移 (Body 系)
-            # t_diff_body_imu = pim.deltaPij()
-
-            # # 计算点积
-            # dot_prod = np.dot(t_diff_body_vis.flatten(), t_diff_body_imu.flatten())
-
-            # print(f"Frame {i}->{i+1}: Dot Product = {dot_prod:.4f}")
-            # print(f"  Vis Vec (Body): {t_diff_body_vis.flatten()}")
-            # print(f"  IMU Vec (Body): {t_diff_body_imu.flatten()}")
-            # ======================= 负数尺度debug =======================
+            # ======================= VIO scale debug =======================
+            # if i < 10 or i % 5 == 0:
+            #     vis_dp_c0 = t_j - t_i
+            #     vis_dp_bi = R_i.T @ vis_dp_c0
+            #     ext_term = -T_bc[:3, 3] + (R_i.T @ R_j) @ T_bc[:3, 3]
+            #     imu_dp = np.asarray(pim.deltaPij()).reshape(3)
+            #     imu_dv = np.asarray(pim.deltaVij()).reshape(3)
+            #     vis_norm = np.linalg.norm(vis_dp_bi)
+            #     imu_norm = np.linalg.norm(imu_dp)
+            #     ext_norm = np.linalg.norm(ext_term)
+            #     dot = float(np.dot(vis_dp_bi, imu_dp))
+            #     cos = dot / (vis_norm * imu_norm + 1e-12)
+            #     print(
+            #         f"[ScaleDebug] factor {i}: "
+            #         f"dt={dt:.4f}, "
+            #         f"|vis_dp_bi|={vis_norm:.6f}, "
+            #         f"|imu_dp|={imu_norm:.6f}, "
+            #         f"|ext|={ext_norm:.6f}, "
+            #         f"imu/vis={imu_norm / (vis_norm + 1e-12):.6f}, "
+            #         f"cos={cos:.6f}"
+            #     )
+            #     print(f"  vis_dp_bi = {vis_dp_bi}")
+            #     print(f"  imu_dp     = {imu_dp}")
+            #     print(f"  imu_dv     = {imu_dv}")
+            #     print(f"  ext_term   = {ext_term}")
+            # ======================= VIO scale debug =======================
 
             # print(f"【System Init】: t_i: {t_i}")
             # print(f"【System Init】: t_j: {t_j}")
@@ -162,7 +177,8 @@ class VIOInitializer:
             tmp_A[0:3, 9] =  np.matmul(R_i.T, t_j - t_i) / 100.0
 
             # 位置误差（这里似乎和VINS-Fusion有出入，看起来是有没有加入外参的问题）
-            tmp_b[0:3] = pim.deltaPij() - T_bc[:3, 3] + np.matmul(R_i.T, R_j) @ T_bc[:3, 3]
+            t_ext = T_bc[:3, 3]
+            tmp_b[0:3] = pim.deltaPij() + t_ext - np.matmul(R_i.T, R_j) @ t_ext
 
             # 速度误差对KF_i速度的雅可比？
             tmp_A[3:6, 0:3] = -np.eye(3)
@@ -205,8 +221,86 @@ class VIOInitializer:
         gravity = x[-4:-1]
         velocities = x[:3*num_frames]
 
-        # print(f"【System Init】: scale: {scale}")
-        # print(f"【System Init】: result: {np.linalg.norm(gravity)} gravity: {gravity}")
+        # ======================= VIO scale debug =======================
+        # eigvals = np.linalg.eigvalsh(H)
+        # cond = np.linalg.cond(H)
+        # vel = velocities.reshape(-1, 3)
+        # vel_norms = np.linalg.norm(vel, axis=1)
+        # print("[ScaleDebug] linear_alignment result:")
+        # print(f"  scale = {scale}")
+        # print(f"  gravity = {gravity}, |g|={np.linalg.norm(gravity)}")
+        # print(f"  H cond = {cond:.3e}")
+        # print(f"  H eig min/max = {eigvals[0]:.3e} / {eigvals[-1]:.3e}")
+        # print(
+        #     f"  velocity norm min/max = "
+        #     f"{vel_norms.min():.6f} / {vel_norms.max():.6f}"
+        # )
+
+        # def debug_residual_for_scale(test_scale, velocities_vec, gravity_vec):
+        #     total_pos = 0.0
+        #     total_vel = 0.0
+        #     count = 0
+
+        #     for k, factor_info_dbg in enumerate(imu_factors):
+        #         pim_dbg = factor_info_dbg['imu_preintegration']
+        #         start_ts_dbg = factor_info_dbg['start_kf_timestamp']
+        #         end_ts_dbg = factor_info_dbg['end_kf_timestamp']
+
+        #         kf_start_dbg = next(
+        #             (kf for kf in keyframes if kf.get_timestamp() == start_ts_dbg), None
+        #         )
+        #         kf_end_dbg = next(
+        #             (kf for kf in keyframes if kf.get_timestamp() == end_ts_dbg), None
+        #         )
+        #         if not kf_start_dbg or not kf_end_dbg:
+        #             continue
+
+        #         dt_dbg = pim_dbg.deltaTij()
+        #         T_i_dbg = kf_start_dbg.get_global_pose()
+        #         T_j_dbg = kf_end_dbg.get_global_pose()
+        #         R_i_dbg = (T_i_dbg @ np.linalg.inv(T_bc))[:3, :3]
+        #         R_j_dbg = (T_j_dbg @ np.linalg.inv(T_bc))[:3, :3]
+        #         t_i_dbg = T_i_dbg[:3, 3]
+        #         t_j_dbg = T_j_dbg[:3, 3]
+
+        #         v_i = velocities_vec[k * 3:k * 3 + 3]
+        #         v_j = velocities_vec[(k + 1) * 3:(k + 1) * 3 + 3]
+
+        #         pos_pred = (
+        #             -dt_dbg * v_i
+        #             + R_i_dbg.T @ gravity_vec * dt_dbg * dt_dbg / 2.0
+        #             + (R_i_dbg.T @ (t_j_dbg - t_i_dbg)) * test_scale
+        #         )
+        #         pos_b = (
+        #             np.asarray(pim_dbg.deltaPij()).reshape(3)
+        #             - T_bc[:3, 3]
+        #             + (R_i_dbg.T @ R_j_dbg) @ T_bc[:3, 3]
+        #         )
+        #         vel_pred = (
+        #             -v_i
+        #             + (R_i_dbg.T @ R_j_dbg) @ v_j
+        #             + R_i_dbg.T @ gravity_vec * dt_dbg
+        #         )
+        #         vel_b = np.asarray(pim_dbg.deltaVij()).reshape(3)
+
+        #         pos_res = pos_pred - pos_b
+        #         vel_res = vel_pred - vel_b
+        #         total_pos += float(pos_res @ pos_res)
+        #         total_vel += float(vel_res @ vel_res)
+        #         count += 1
+
+        #     if count > 0:
+        #         print(
+        #             f"[ScaleDebug] residual test scale={test_scale:.6f}: "
+        #             f"pos_rmse={np.sqrt(total_pos / count):.6f}, "
+        #             f"vel_rmse={np.sqrt(total_vel / count):.6f}, "
+        #             f"count={count}"
+        #         )
+
+        # debug_residual_for_scale(scale, velocities, gravity)
+        # debug_residual_for_scale(1.0, velocities, gravity)
+        # ======================= VIO scale debug =======================
+
         return scale, gravity, velocities
 
     @staticmethod
@@ -272,7 +366,8 @@ class VIOInitializer:
                 tmp_A[0:3, 8]=  np.matmul(R_i.T, t_j - t_i) / 100.0
 
                 # 位置误差（这里似乎和VINS-Fusion有出入）
-                tmp_b[0:3] = pim.deltaPij() - np.matmul(R_i.T, g0) * dt * dt / 2 - T_bc[:3, 3] + np.matmul(R_i.T, R_j) @ T_bc[:3, 3]
+                t_ext = T_bc[:3, 3]
+                tmp_b[0:3] = pim.deltaPij() - np.matmul(R_i.T, g0) * dt * dt / 2 + t_ext - np.matmul(R_i.T, R_j) @ t_ext
 
                 # 速度误差对KF_i速度的雅可比？
                 tmp_A[3:6, 0:3] = -np.eye(3)
@@ -406,7 +501,7 @@ class VIOInitializer:
         
         print(f"【Initializer】: Alignment to world frame complete, gravity_w: {gravity_w}")
 
-        return gravity_w
+        return gravity_w, R_final_w_c0
 
     @staticmethod # 静态方法，不需要实例化，不需要传递self
     def initialize(keyframes, imu_factors, imu_processor, gravity_magnitude, T_bc):
@@ -418,18 +513,18 @@ class VIOInitializer:
         repropagated_imu_factors = VIOInitializer.repropagate_imu(imu_factors, imu_processor, bg0)
         if not repropagated_imu_factors:
             print("【System Init】: Repropagation failed.")
-            return False, None, None, None, None
+            return False, None, None, None, None, None
 
         scale, gravity, velocities = VIOInitializer.linear_alignment(keyframes, repropagated_imu_factors, gravity_magnitude, T_bc)
         if scale is None or gravity is None:
             print("【System Init】: Failed to intialize scale and gravity")
-            return False, None, None, None, None
+            return False, None, None, None, None, None
 
         refine_scale, refine_gravity, refine_velocities = VIOInitializer.refine_gravity(keyframes, repropagated_imu_factors, gravity, gravity_magnitude, T_bc)
         if refine_scale is None or refine_gravity is None:
             print("【System Init】: Failed to refine scale and gravity")
-            return False, None, None, None, None
+            return False, None, None, None, None, None
 
-        gravity_w = VIOInitializer.align_to_world_frame(keyframes, refine_velocities, refine_gravity, refine_scale, T_bc)
+        gravity_w, R_final_w_c0 = VIOInitializer.align_to_world_frame(keyframes, refine_velocities, refine_gravity, refine_scale, T_bc)
 
-        return True, refine_scale, bg0, refine_velocities, gravity_w
+        return True, refine_scale, bg0, refine_velocities, gravity_w, R_final_w_c0
