@@ -155,6 +155,8 @@ cache
 data
 figures/*.pdf
 *.MOV
+trajectory_plots/
+saved_trajectories/
 
 rsync*
 models/*
